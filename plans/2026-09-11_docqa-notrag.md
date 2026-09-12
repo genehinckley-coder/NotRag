@@ -36,8 +36,11 @@ corpus fits in context; retrieval is the model's job, not a preprocessing step's
   item 2: offsets are code points (not UTF-16 units or UTF-8 bytes), the `title` is not
   folded into the indexed text, and the API indexes CRLF text as sent rather than
   normalizing it. Item 3 still normalizes line endings; see item 3 for why.
-- The API key in `D:\claude\apikeys\anthropic_course-key.txt` is valid and has credit. It
-  is a "course" key — quota may be limited, so billed guess-and-check is capped.
+- The API key in `D:\claude\apikeys\notrag_key.txt` (`config.API_KEY_PATH`) is valid and
+  has credit. Earlier drafts named `anthropic_course-key.txt`; that is not the key in use.
+  The file carries a hand-written expiry note above the key, so the loader selects the one
+  line starting `sk-ant-` rather than reading the whole file. Quota on this key is
+  unverified, so billed guess-and-check stays capped.
 - Corpus is static during a session.
 - `claude-opus-5` is the model. Not requested explicitly; it is the current default, and
   this is regulatory text where correctness beats cost.
@@ -80,8 +83,9 @@ These were wrong and are recorded so the errors don't get re-derived:
 nothing. Both were wrong, and the obvious implementations of credential loading are the
 insecure ones.
 **What:**
-- Add a `.gitignore` in `D:\code\NotRag\` covering `apikeys/`, `*.key`, `*-key.txt`, and
-  `.venv/` — the code directory is separate from `D:\claude\apikeys\` where the key file
+- Add a `.gitignore` in `D:\code\NotRag\` covering `apikeys/`, `*.key`, `*-key.txt`,
+  `*_key.txt` (matches the real key's name, `notrag_key.txt`), `.env*`, and `.venv/` — the
+  code directory is separate from `D:\claude\apikeys\` where the key file
   lives, but the ignore rule is cheap insurance if a key ever ends up copied in.
 - Initialize a **private** git repository for the project in `D:\code\NotRag\` before
   installing any dependencies: `git init`, commit the `.gitignore` first, then create the
@@ -336,7 +340,7 @@ is written once and read cheaply for every follow-up.
 - Commands: `/reset`, `/reload` (re-extract from disk, picking up edited files —
   invalidates the cache, which is correct when files changed), `/cost`, `/exit`. Typed
   exception handling, most-specific-first. Surface `RateLimitError` and credit exhaustion
-  as their own message — this is a course key with possibly limited quota.
+  as their own message — quota on this key is unverified.
 **Depends on:** Items 5, 6.
 **Risks:** Conversation tail grows across a long session; `/reset` is the escape hatch and
 tail auto-caching keeps the cost of not resetting low.
