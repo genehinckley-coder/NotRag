@@ -1,0 +1,37 @@
+# --- Secrets -----------------------------------------------------------------
+# The real key lives outside this tree (D:\claude\apikeys\), but these rules are
+# cheap insurance in case one is ever copied in here.
+apikeys/
+*.key
+*-key.txt
+*_key.txt
+.env
+.env.*
+
+# --- Python virtual environment ----------------------------------------------
+.venv/
+venv/
+
+# --- Python build / cache artifacts ------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Corpus support assets ----------------------------------------------------
+# Browser "Save Page As" sidecar folders: CSS, JS, images. The .htm files
+# themselves are tracked; these are not read by the extractor.
+admincode/*_files/
+
+# --- Local runtime state ------------------------------------------------------
+.notrag_state.json
+
+# --- Editor / OS --------------------------------------------------------------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
