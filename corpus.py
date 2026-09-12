@@ -41,6 +41,7 @@ from config import (
     MODEL,
     PRICE_CACHE_WRITE_1H_PER_MTOK,
     STATE_FILE,
+    SYSTEM_PROMPT,
     TOKEN_CEILING,
 )
 from credentials import build_client
@@ -90,7 +91,8 @@ class Corpus:
     documents: tuple[ExtractedDocument, ...]
     #: SHA-256 of the document blocks' canonical JSON, in hex.
     fingerprint: str
-    #: ``count_tokens`` for the document blocks plus a placeholder question.
+    #: ``count_tokens`` for the document blocks plus a placeholder question, and
+    #: the system prompt when the counter was given one.
     tokens: int
 
     def document_blocks(self) -> list[dict[str, Any]]:
@@ -180,9 +182,9 @@ def api_token_counter(
 
     Args:
         client: Client to count with.
-        system: The system prompt, once plan item 5 defines one. It renders
-            before the documents, inside the cached prefix, so it belongs in
-            the count.
+        system: The system prompt, ``config.SYSTEM_PROMPT`` in production. It
+            renders before the documents, inside the cached prefix, so it
+            belongs in the count.
         model: Model whose tokenizer counts.
     """
 
@@ -413,7 +415,7 @@ def main() -> int:
         return 2
 
     try:
-        corpus, check = load_corpus(api_token_counter(client))
+        corpus, check = load_corpus(api_token_counter(client, system=SYSTEM_PROMPT))
     except (ExtractionError, CorpusTooLargeError) as exc:
         print(f"Corpus assembly failed: {exc}", file=sys.stderr)
         return 1
@@ -443,8 +445,8 @@ def main() -> int:
 
     print(
         f"\nTokens      : {corpus.tokens:,} of the {TOKEN_CEILING:,} ceiling "
-        f"({corpus.tokens / TOKEN_CEILING:.1%}), counted on {MODEL}; the system "
-        f"prompt is not included until plan item 5 defines it"
+        f"({corpus.tokens / TOKEN_CEILING:.1%}), counted on {MODEL} with the "
+        f"system prompt"
     )
     print(f"Fingerprint : {corpus.fingerprint}")
     print(f"Previous run: {describe_check(check, corpus)}")

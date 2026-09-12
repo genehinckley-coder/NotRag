@@ -38,6 +38,7 @@ import lxml.html
 from lxml import etree
 
 from config import CORPUS_DIR, CORPUS_GLOBS, DOCUMENT_LABELS
+from display import escape_controls
 
 #: Class of the one element on an ILGA page that holds the regulation text.
 CONTENT_CLASS = "billtext-scale"
@@ -286,14 +287,6 @@ def _render_row(row: etree._Element) -> str:
 
 # --- Command line ------------------------------------------------------------
 
-#: C0 and C1 control characters other than newline and tab, shown escaped so
-#: corpus text cannot drive the terminal.
-_CONTROL_ESCAPES = {
-    code: f"\\x{code:02x}"
-    for code in (*range(0x20), 0x7F, *range(0x80, 0xA0))
-    if chr(code) not in "\n\t"
-}
-
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Plan item 3: extract the corpus.")
@@ -318,7 +311,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        print(matches[0].text.translate(_CONTROL_ESCAPES))
+        print(escape_controls(matches[0].text))
         return 0
 
     header = f"{'document':<26}{'chars':>10}{'paragraphs':>12}{'lines':>8}"

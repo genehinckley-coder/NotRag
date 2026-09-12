@@ -6,3 +6,6 @@ testpaths = ["tests"]
 # The application modules live at the project root.
 pythonpath = ["."]
 addopts = ["--strict-markers"]
+markers = [
+    "live: calls the real Anthropic API and costs money; skipped unless NOTRAG_LIVE=1",
+]
