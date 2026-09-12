@@ -28,7 +28,8 @@ dist/
 admincode/*_files/
 
 # --- Local runtime state ------------------------------------------------------
-.notrag_state.json
+# The trailing * covers the .tmp file an interrupted state write can leave.
+.notrag_state.json*
 
 # --- Editor / OS --------------------------------------------------------------
 .vscode/
