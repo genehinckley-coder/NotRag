@@ -1,0 +1,10 @@
+# Normalize text files to LF in the repository.
+* text=auto
+
+# The corpus is exempt. These files are CRLF throughout, and the corpus
+# fingerprint (plan item 4) plus the citation character offsets (item 6) are
+# defined against exact file content. Git must not rewrite their line endings on
+# commit or checkout. The extractor normalizes line endings itself, in one
+# place, where the behaviour is visible and tested.
+*.htm  -text
+*.html -text
