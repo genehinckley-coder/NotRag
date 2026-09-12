@@ -1,0 +1,8 @@
+# Tool configuration only. NotRag is run from a checkout, not installed as a
+# package; dependencies are pinned in requirements.txt.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The application modules live at the project root.
+pythonpath = ["."]
+addopts = ["--strict-markers"]
