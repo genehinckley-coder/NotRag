@@ -1,5 +1,5 @@
 # DocQA ("NotRag") — Question Answering Over a Local Document Folder
-_Generated: 2026-09-11 · Revised after plan review_
+_Generated: 2026-09-11 · Revised after plan review · Item 2 findings added 2026-09-12_
 
 ## Goal
 
@@ -30,10 +30,12 @@ corpus fits in context; retrieval is the model's job, not a preprocessing step's
 - **`document` content blocks accept a plain-text source, `citations`, `cache_control`,
   `thinking`, and `output_config` simultaneously.** The caching+citation combination is the
   basis of this design. Each feature is documented; the combination is not. **Highest-risk
-  assumption; item 2 tests the full production request shape.**
-- **Character offsets in `char_location` index the exact string we send.** Item 3
-  normalizes line endings so there is no CRLF/LF ambiguity for the API to resolve
-  differently than we do. Item 2 tests this against a realistic fixture.
+  assumption — confirmed 2026-09-12: item 2's spike passed all six checks against the full
+  production request shape.**
+- **Character offsets in `char_location` index the exact string we send.** Confirmed by
+  item 2: offsets are code points (not UTF-16 units or UTF-8 bytes), the `title` is not
+  folded into the indexed text, and the API indexes CRLF text as sent rather than
+  normalizing it. Item 3 still normalizes line endings; see item 3 for why.
 - The API key in `D:\claude\apikeys\anthropic_course-key.txt` is valid and has credit. It
   is a "course" key — quota may be limited, so billed guess-and-check is capped.
 - Corpus is static during a session.
@@ -52,6 +54,12 @@ These were wrong and are recorded so the errors don't get re-derived:
   `<style>`, which extraction strips. It is a non-issue, not a Word run-on paragraph.
 - All six files have a byte-identical `<title>ADMINISTRATIVE CODE</title>`. The page title
   is unusable as a document label.
+- The corpus contains **no `§`, no em dashes, and no characters outside the BMP** (measured
+  across all six files after crude extraction, 2026-09-12). Sections appear in the text as
+  "Section 175.410", not "§ 175.410". The characters that actually stress offsets are
+  U+00A0 (14,711 occurrences) and CR (17,731). Item 2's fixtures include `§`, an em dash and
+  one non-BMP character anyway: the first two because this plan named them, the last
+  because it is the only way to tell code-point offsets from UTF-16 offsets.
 
 ## Out of Scope
 
@@ -146,10 +154,37 @@ open questions:
 fuzzy string-match reporting. If (6) fails, the fallback is a per-turn breakpoint, which
 hits the 4-breakpoint-per-request maximum by turn four and needs a rolling-breakpoint
 strategy — design that only if (6) fails.
-**Open questions:** The exact Python dict shape for a plain-text `document` source is not
-in the bundled SDK docs. Cap guess-and-check at two or three attempts against the billed
-endpoint, then read the installed SDK's type stubs for the document-source union — they
-are authoritative and free to consult.
+**Open questions:** Resolved. The installed SDK's type stubs (`anthropic` 1.5.0,
+`PlainTextSourceParam`) give the source shape as
+`{"type": "text", "media_type": "text/plain", "data": ...}`, so no billed guess-and-check
+was needed.
+
+**Result (2026-09-12): all six checks PASS.** Script: `spike_request_shape.py`, branch
+`item-2-spike`. It makes five streamed calls against two synthetic ~1K-token fixtures
+modeled on the ILGA layout (hard line wraps mid-sentence, U+00A0 runs after subsection
+markers), one sent with CRLF line endings and one with LF. About $0.10 per run.
+1. Offsets round-trip as code points across a line break, a U+00A0 and a `§`. Spans after
+   the non-BMP character rule out UTF-16 units and UTF-8 bytes. The title is not folded in.
+2. Accepted with `output_config: {"effort": "high"}`; 13 citations returned.
+3. Accepted with `thinking: {"type": "adaptive", "display": "summarized"}`. The streaming
+   accumulator (`get_final_message()`) preserves citations.
+4. The document breakpoint wrote 3,100 tokens; a *different* question then read exactly
+   3,100.
+5. Reported as a 1-hour write (`ephemeral_1h_input_tokens` 3,100, 5-minute 0) and read in
+   full 5.5 minutes after the last request, so the TTL is not silently downgraded.
+6. Turn 2 read 3,123 tokens, 23 past the explicit breakpoint. The rolling-breakpoint
+   fallback under **Risks** is not needed.
+
+Findings that change later items (each is written into that item below):
+- The API indexes CRLF text as sent: all 17 spans into the CRLF fixture matched the raw
+  text (item 3).
+- One answer can cite the same span twice, and spans absorb trailing separator whitespace
+  (item 6).
+- A cited answer can end in an empty text block, which the API rejects when it is sent
+  back. The spike's first run failed check 6 on exactly this (item 7).
+- The spike set each document's `context` to `Source file: <filename>`. Like the labels,
+  `context` is part of the cached prefix. Item 4 should adopt that format, or choose
+  another, before the first real cache write.
 
 ### 3. Structure-preserving HTML text extraction
 **Why:** Naive extraction destroys the thing that makes this corpus answerable. The sump
@@ -166,8 +201,9 @@ the sibling `*_files\` directories hold CSS and images. Specifically:
   association with row and column headings. That is a correctness failure, not a
   formatting one.
 - **Normalize line endings**: `.replace("\r\n", "\n").replace("\r", "\n")`, then assert
-  `"\r" not in text`. All six files are CRLF throughout. Any surviving `\r` makes our
-  offsets depend on whether the API normalizes before indexing.
+  `"\r" not in text`. All six files are CRLF throughout. Item 2 showed the API indexes
+  CRLF text as sent, so offsets do not depend on this step. Normalize anyway, so the
+  extracted text (and item 4's fingerprint) does not change with how a file was saved.
 - **Replace U+00A0, not `&nbsp;`.** lxml decodes entities at parse time, so there is no
   literal `&nbsp;` string left to replace — `text.replace("&nbsp;", " ")` is a silent
   no-op that looks handled. Use `text.replace("\u00a0", " ")`. File 175 alone has 8,514 of
@@ -240,6 +276,14 @@ call, no added latency, no added cost.
 - **Mismatch** — in range, correct length, text differs.
 - **Match** — exact.
 
+Two behaviors observed in item 2 that the reporter must handle:
+- **Duplicate spans.** One answer can cite the same `(document_index, start, end)` twice.
+  Count it once in "quotes matched" and in any length-based measure; otherwise duplicates
+  inflate both.
+- **Trailing whitespace.** Spans often run past the sentence into the blank separator
+  lines that follow it. That is a legitimate match, not a mismatch. Exclude whitespace
+  when measuring coverage, so separators don't count as sourced text.
+
 Report per answer: quotes matched, each failure with its category, and **the fraction of
 each cited block's characters actually covered by citation spans**. Citations attach at
 text-block granularity, so a block with four sentences and one citation would otherwise
@@ -271,6 +315,13 @@ is written once and read cheaply for every follow-up.
   which the API rejects for non-alternating roles. That breaks the session permanently and
   the user has no reason to connect it to a network blip three questions earlier. Wrap the
   stream in try/finally; treat `KeyboardInterrupt` as an API error.
+- **Drop empty text blocks before committing the assistant turn.** A cited answer arrives
+  as many text blocks and can end in an empty one. Item 2 saw the layout `thinking,
+  text(13), text(234, 1 cite), text(23), text(152, 1 cite), text(0)`. Sending that back
+  fails the *next* turn with a 400 ("text content blocks must be non-empty"), which breaks
+  the session the same way the non-alternating case does. Filter out only the empty text
+  blocks. Send thinking blocks back with their signatures and text blocks with their
+  citations, unchanged. `replayable()` in `spike_request_shape.py` is the reference.
 - **Assert the cache hit.** The entire economic case rests on a prefix match, and prefix
   matching fails *silently* — a correct answer at 5–8× the cost with no error. After every
   call, compare `usage.cache_read_input_tokens` against the expected corpus size; on turn
@@ -301,7 +352,8 @@ mode and was untested in the first draft.
   a literal U+00A0 in the fixture is replaced; CRLF input yields no `\r` in output.
 - Quote reporter: exact citation matches; off-by-one offset reports as mismatch;
   out-of-range offset and out-of-range `document_index` each report as their own category
-  rather than raising or masquerading as a mismatch; degenerate zero-length span rejected.
+  rather than raising or masquerading as a mismatch; degenerate zero-length span rejected;
+  a span cited twice counts once.
 - Size guard: **make the token counter an injectable dependency** so the abort can be
   asserted at ceiling+1 and its absence at ceiling−1 without a live API call.
 - Assembly determinism: same inputs produce a byte-identical corpus and a stable
@@ -309,7 +361,8 @@ mode and was untested in the first draft.
 - System prompt: hash-pinned, so an accidental edit that would cold-start the cache fails a
   test instead of quietly costing money.
 - REPL state: a mocked failing client leaves `messages` in a valid alternating state; a
-  post-`/reset` `messages[0]` contains exactly one text block.
+  post-`/reset` `messages[0]` contains exactly one text block; an assistant reply ending in
+  an empty text block is committed without it, with every other block unchanged.
 - One end-to-end smoke test asking the sump question and asserting §175.410 appears —
   marked and **skipped by default**, since it costs real money.
 **Depends on:** Items 3, 6, 7.
