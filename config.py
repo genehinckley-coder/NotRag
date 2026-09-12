@@ -80,6 +80,8 @@ MIN_CITATION_LENGTH: Final[int] = 8
 
 PRICE_INPUT_PER_MTOK: Final[float] = 5.00
 PRICE_CACHE_WRITE_1H_PER_MTOK: Final[float] = 10.00
+#: 1.25x input. Applies to the conversation tail (CONVERSATION_CACHE_TTL).
+PRICE_CACHE_WRITE_5M_PER_MTOK: Final[float] = 6.25
 PRICE_CACHE_READ_PER_MTOK: Final[float] = 0.50
 PRICE_OUTPUT_PER_MTOK: Final[float] = 25.00
 
