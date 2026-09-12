@@ -112,6 +112,10 @@ DOCUMENT_LABELS: Final[dict[str, str]] = {
     ),
 }
 
+#: CACHE-AFFECTING. Each document block's ``context``: metadata the model reads
+#: but cannot cite. Plan item 2's spike ran with exactly this format.
+DOCUMENT_CONTEXT_TEMPLATE: Final[str] = "Source file: {filename}"
+
 #: Shown to the user once per session. The guarantee is provenance, not
 #: entailment -- the word "verified" is never used for a quote match.
 MATCH_DISCLAIMER: Final[str] = (
