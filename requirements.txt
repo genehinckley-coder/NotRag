@@ -1,0 +1,12 @@
+# Direct dependencies, pinned. Install into the project venv only:
+#
+#   python -m venv .venv
+#   .venv\Scripts\Activate.ps1
+#   python -m pip install -r requirements.txt
+#
+# Transitive dependencies are intentionally not listed; pip resolves them.
+
+anthropic==1.5.0   # Messages API, token counting, streaming, citations
+lxml==6.1.3        # HTML parsing and structure-preserving text extraction
+pytest==9.1.1      # test runner
+rich==15.0.0       # stream delta rendering and escaped display of quoted text
