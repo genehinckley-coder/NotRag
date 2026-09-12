@@ -1,5 +1,5 @@
 # DocQA ("NotRag") — Question Answering Over a Local Document Folder
-_Generated: 2026-09-11 · Revised after plan review · Item 2 findings added 2026-09-12_
+_Generated: 2026-09-11 · Revised after plan review · Item 2 and 3 findings added 2026-09-12_
 
 ## Goal
 
@@ -222,6 +222,38 @@ the sibling `*_files\` directories hold CSS and images. Specifically:
 **Risks:** None material once tables are handled.
 **Open questions:** None — the `<title>` question from the first draft is closed above.
 
+**Result (2026-09-12): built.** Module `extract.py`, tests `tests/test_extract.py` (25
+pass, offline), branch `item-3-extraction`. The six files extract to 480,932 characters
+(item 1's crude pass: 524,242). Tokens are re-counted in item 4 against the assembled
+request.
+- Output shape: one blank line between paragraphs; `<br>` is a line break; a table is one
+  paragraph with one line per `<tr>` and cells joined by ` | `. A cell holding several
+  `<p>` elements, as ILGA's column headings often do, is flattened onto its line. ILGA
+  follows every content paragraph with a U+00A0-only spacer paragraph, so dropping empty
+  paragraphs reproduces the page's rhythm exactly.
+- Only `div.billtext-scale` is read. It holds all of the regulation text in every file;
+  the only text outside it is "Illinois General Assembly ILGA.GOV". A page without
+  exactly one such element is an error, not a fallback to the whole page.
+- Line endings and U+00A0 are handled by one rule: every whitespace run inside a line
+  becomes a single space (`\s` is Unicode-aware, so it covers CR, LF and U+00A0).
+  Explicit checks, not `assert`, then confirm the output has no CR and no U+00A0.
+- `extract_corpus()` stops with an error when the files and `DOCUMENT_LABELS` disagree in
+  either direction. An unlabeled file has no acceptable fallback title, and a labeled file
+  missing from disk would mean answering from a partial corpus.
+- `rowspan` is not expanded. The corpus has two, both in file 175's effective-dates table,
+  and each spans into a row whose other cell is an empty spacer, so nothing is lost.
+- Subsection depth is carried by the markers alone, not by indentation. The source's
+  `margin-left` is inconsistent within a single list (items 12–15 at 1.5in, item 16 at
+  110.15pt), so reproducing it would add noise. The known ambiguity is that §175.410 has
+  both a first-level `i)` and a fourth-level `i)`. Adding indentation later changes the
+  cached prefix, which costs one cold start.
+
+Findings that change later items:
+- Item 4 receives `extract_corpus()`'s list of `ExtractedDocument(filename, label, text)`,
+  already in filename order and already checked against the labels.
+- Item 5 is where a subsection-path mix-up would first show (see its **Risks**).
+- Item 8's extraction tests have landed.
+
 ### 4. Corpus assembly, fingerprint, and hard size guard
 **Why:** Prevents the worst failure mode in this class of app: silently truncating the
 corpus and confidently answering from a partial source.
@@ -261,7 +293,9 @@ cross-referencing is what adaptive thinking is for.
 **Depends on:** Items 2, 4.
 **Risks:** Citations are incompatible with `output_config.format`, so structured JSON
 output is permanently unavailable on this path. Not needed now; forecloses a future
-"answer as JSON" feature.
+"answer as JSON" feature. Extraction carries subsection depth in the markers only (item 3).
+If answers mix up subsection paths, for example reading a first-level `i)` as a
+fourth-level one, that is the trigger to add indentation to extraction.
 **Open questions:** `thinking.display: "summarized"` is documented for this model and is
 worth setting, but it is only *useful* in combination with real delta rendering — noted
 above so the two don't get separated.
@@ -354,6 +388,7 @@ mode and was untested in the first draft.
 - Extraction: subsection markers survive; block boundaries preserved; **a table-bearing
   fixture taken from file 175** keeps cell/row structure; `_files\` directories excluded;
   a literal U+00A0 in the fixture is replaced; CRLF input yields no `\r` in output.
+  *Landed with item 3 in `tests/test_extract.py`.*
 - Quote reporter: exact citation matches; off-by-one offset reports as mismatch;
   out-of-range offset and out-of-range `document_index` each report as their own category
   rather than raising or masquerading as a mismatch; degenerate zero-length span rejected;
