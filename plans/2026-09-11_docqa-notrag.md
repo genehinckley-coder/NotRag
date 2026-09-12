@@ -1,5 +1,5 @@
 # DocQA ("NotRag") — Question Answering Over a Local Document Folder
-_Generated: 2026-09-11 · Revised after plan review · Item 2, 3 and 4 findings added 2026-09-12_
+_Generated: 2026-09-11 · Revised after plan review · Item 2, 3, 4 and 5 findings added 2026-09-12_
 
 ## Goal
 
@@ -27,7 +27,7 @@ corpus fits in context; retrieval is the model's job, not a preprocessing step's
 
 - **The extracted corpus fits in context with room to spare.** Confirmed: item 1's crude
   count was 175,314 tokens, and item 4 counts the assembled corpus at 199,583, which is 49.9%
-  of the 400K ceiling.
+  of the 400K ceiling (199,731 with item 5's system prompt).
 - **`document` content blocks accept a plain-text source, `citations`, `cache_control`,
   `thinking`, and `output_config` simultaneously.** The caching+citation combination is the
   basis of this design. Each feature is documented; the combination is not. **Highest-risk
@@ -347,6 +347,50 @@ fourth-level one, that is the trigger to add indentation to extraction.
 worth setting, but it is only *useful* in combination with real delta rendering — noted
 above so the two don't get separated.
 
+**Result (2026-09-12): built, and the live sump question passes.** Module `answer.py`, tests
+`tests/test_answer.py` (41 pass offline, plus one `live` test skipped unless
+`NOTRAG_LIVE=1`), branch `item-5-answer-path`. `python answer.py <question>` asks one
+question.
+- **Live run**, the question from **Goal**: 55 s, `end_turn`, 5,313 output tokens, 32
+  distinct citations across Parts 172, 174, 175 and 176, **$2.13** with a cold cache. The
+  answer is organized around §175.410(a)–(n) and names the related provisions: 175.300(f),
+  175.420(b), 175.425(h), 175.450(e)(15), 175.630(f), 175.700(f), 176.430(b)(6),
+  176.655(b)–(c) and 172.110(a)(2)(H). The subsection paths spot-checked against the
+  cited spans' own markers, (h)(1)–(3) and (l)(2)(A)–(C), are right. The `i)` mix-up named
+  under **Risks** did not appear, so indentation stays out of extraction.
+- The cache write was billed at 199,727 tokens, at the 1-hour rate. `count_tokens` with the
+  system prompt gives 199,731. The 4-token gap is most likely the placeholder question,
+  which sits after the breakpoint.
+- `SYSTEM_PROMPT` lives in `config.py`, marked CACHE-AFFECTING, and its SHA-256 is pinned in
+  the tests. `corpus.py` now counts with it too, so both scripts record the same token count
+  in the state file. The fingerprint still covers only the document blocks. The pinned hash
+  catches accidental edits, and item 7's cache-miss check catches the rest.
+- Deviations from the text above:
+  1. The truncation warning cannot sit above a streamed answer, which is on screen before
+     `stop_reason` arrives. It prints right after the answer, before the sources, and
+     `Answer.stop_warning` carries it for item 7.
+  2. Citation markers print at `content_block_stop`, after the cited block, rather than on
+     each `citation` event. Citations attach to the whole block.
+  3. Every stop reason other than `end_turn` is flagged, not only `max_tokens`: `refusal`
+     as a refusal, anything else as possibly incomplete. The CLI exits 1 on any of them.
+- After the answer come the stop warning, then a numbered sources list (label, character
+  span, and a flattened 160-character excerpt), then a `NOT CACHED` warning if the response
+  shows no cache write or read, and a usage line pricing the three input buckets.
+- **rich does not stop terminal escapes.** Measured on rich 15.0.0: `Text` strips BEL and
+  CR but passes ESC through, so `\x1b[31m` in source text or model output reaches the
+  terminal. `extract.py`'s control-character table moved to `display.escape_controls`
+  (tests in `tests/test_display.py`), and everything untrusted goes through it before rich.
+
+Findings that change later items:
+- Item 6 must use `display.escape_controls`, not rich alone; its text is corrected. Citation
+  spans do not start at paragraph boundaries (see item 6).
+- Item 7 can reuse `answer.cost_usd` and `answer.cache_warning`. The billed cache size is
+  now measured (above).
+- Item 8's system prompt test and live smoke test have landed.
+- Open: the system prompt's example, Section 175.410(h)(1), is a real sump provision and
+  may nudge unrelated questions toward it. A neutral example costs one cold write (~$2).
+  Not changed.
+
 ### 6. Quote-match reporter (no LLM call)
 **Why:** Nearly free: native citations return `cited_text` plus `char_location` offsets
 into the exact strings we sent, so this is a local string comparison — no second model
@@ -369,6 +413,15 @@ Two behaviors observed in item 2 that the reporter must handle:
   lines that follow it. That is a legitimate match, not a mismatch. Exclude whitespace
   when measuring coverage, so separators don't count as sourced text.
 
+Observed in item 5's live run:
+- **Spans do not start at paragraphs.** The API splits a document into sentences for
+  citation, and the split breaks at abbreviations. One span began `6837, effective May 2,
+  2023) Section 175.410 ...`, the tail of the previous section's Source note, split after
+  "Ill. Reg.". Spans can also be long; one ran 4,168 characters. Don't infer a citation's
+  section from where its span starts.
+- `answer.render_summary` already prints a numbered sources list. Add each citation's match
+  category to that list rather than building a second one.
+
 Report per answer: quotes matched, each failure with its category, and **the fraction of
 each cited block's characters actually covered by citation spans**. Citations attach at
 text-block granularity, so a block with four sentences and one citation would otherwise
@@ -376,8 +429,9 @@ count as fully sourced while three assertions ride along uncited. Never print th
 "verified." Return a result structure and render it — **do not use bare `assert`**, which
 is stripped under `python -O` (the guarantee silently vanishes) and which would kill the
 REPL turn on a mismatch, the exact case this item exists to report on. Render quoted text
-through `rich`'s escaping rather than bare `print`, so escape sequences in source text
-cannot rewrite the terminal.
+through `display.escape_controls`, then `rich`'s `Text`, never bare `print`. Rich alone is
+not enough: item 5 measured that it passes ESC through, so escape sequences in source text
+could rewrite the terminal.
 **Depends on:** Items 4, 5. Needs the exact in-memory strings sent, indexed in send order.
 **Risks:** Already stated in **Goal**: this proves provenance, not entailment.
 **Open questions:** None.
@@ -415,10 +469,13 @@ is written once and read cheaply for every follow-up.
   ≥2, print a loud `CACHE MISS` line with expected vs actual when it falls short. Take the
   expected size from the first turn's billed cache write, not `Corpus.tokens`. That field
   comes from `count_tokens`, which is an estimate and counts a placeholder question.
+  Item 5's live run billed a 199,727-token write against a `count_tokens` figure of
+  199,731. `answer.cache_warning` already flags a response with no cache activity at all.
 - **Cost display needs three input buckets, not one.** `usage.input_tokens` *excludes*
   cached tokens. Sum `input_tokens` at $5/MTok, `cache_creation_input_tokens` at ~$10/MTok
   (1h write), and `cache_read_input_tokens` at ~$0.50/MTok, plus output at $25/MTok. A
-  single multiply under-reports the first turn by roughly 10×.
+  single multiply under-reports the first turn by roughly 10×. `answer.cost_usd` does
+  this; reuse it.
 - **Warn before the context window, not at it.** Track cumulative input tokens; warn around
   70% of the window suggesting `/reset`. Item 4's ceiling protects startup; nothing
   otherwise protects turn 40, which would take a `BadRequestError` mid-conversation.
@@ -452,12 +509,14 @@ mode and was untested in the first draft.
   guard is tested at the ceiling and at ceiling+1, and determinism is tested across two
   independent extractions of the real corpus.*
 - System prompt: hash-pinned, so an accidental edit that would cold-start the cache fails a
-  test instead of quietly costing money.
+  test instead of quietly costing money. *Landed with item 5 in `tests/test_answer.py`.*
 - REPL state: a mocked failing client leaves `messages` in a valid alternating state; a
   post-`/reset` `messages[0]` contains exactly one text block; an assistant reply ending in
   an empty text block is committed without it, with every other block unchanged.
 - One end-to-end smoke test asking the sump question and asserting §175.410 appears —
-  marked and **skipped by default**, since it costs real money.
+  marked and **skipped by default**, since it costs real money. *Landed with item 5: run
+  it with `NOTRAG_LIVE=1 pytest -m live`. It calls `answer.main`, so it also records the
+  real state file.*
 **Depends on:** Items 3, 6, 7.
 **Risks:** None.
 **Open questions:** None.
