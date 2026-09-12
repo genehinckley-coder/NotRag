@@ -11,6 +11,7 @@ import hashlib
 import io
 import json
 import os
+from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any
 
@@ -36,6 +37,7 @@ from answer import (
 )
 from config import (
     CORPUS_CACHE_TTL,
+    MATCH_DISCLAIMER,
     MAX_TOKENS,
     MODEL,
     OUTPUT_CONFIG,
@@ -44,17 +46,20 @@ from config import (
 )
 from corpus import Corpus, FingerprintCheck, FingerprintStatus, assemble_corpus
 from extract import ExtractedDocument
+from quotes import build_report
 
 #: SHA-256 of ``config.SYSTEM_PROMPT``. The system prompt renders before the
 #: documents, inside the cached prefix, so any edit cold-starts the corpus cache
 #: (about $2 at the current corpus size). If this fails, the edit should be
 #: deliberate: update the hash in the same commit.
-SYSTEM_PROMPT_SHA256 = "19036a68ec22e73bd9222e4164a7d3c43363d74dd48e305a9d0bcc8e49ebdcba"
+SYSTEM_PROMPT_SHA256 = "d62477f1e9365fa5d13c21573612a035a15f8763b6466b3cfbb91e7dcf4e32cb"
 
 SUMP_QUESTION = "what are the sump requirements for a UST in Illinois"
 
 ALPHA = ExtractedDocument("a.htm", "Part A: Alpha Rules", "Alpha text.\n\na) First.")
 BRAVO = ExtractedDocument("b.htm", "Part B: Bravo Rules", "Bravo text.")
+#: The document texts sent, in send order, for checking quotes.
+DOCUMENTS = [ALPHA.text, BRAVO.text]
 
 
 def corpus_of(*documents: ExtractedDocument) -> Corpus:
@@ -389,10 +394,11 @@ def test_an_interrupt_propagates_and_closes_the_stream() -> None:
 # --- Summary -----------------------------------------------------------------
 
 
-def summary_of(message: Message) -> str:
+def summary_of(message: Message, documents: Sequence[str] = DOCUMENTS) -> str:
     result, _ = run(message)
     console = make_console()
-    render_summary(result, console)
+    report = build_report(result.sources, result.message.content, documents)
+    render_summary(result, report, console)
     return output(console)
 
 
@@ -426,6 +432,59 @@ def test_the_truncation_warning_comes_before_the_sources() -> None:
 
 def test_an_answer_without_citations_is_flagged() -> None:
     assert "No citations" in summary_of(message_of(text_block("Unsupported claim.")))
+
+
+def test_each_source_shows_its_match_status_and_why_it_failed() -> None:
+    # ALPHA.text is "Alpha text.\n\na) First."
+    out = summary_of(
+        message_of(
+            text_block("Alpha.", cite(0, 10, text="Alpha text")),
+            text_block(" First.", cite(13, 22, text="a) Frist.")),
+            text_block(" More.", cite(0, 99, text="Alpha text.")),
+        )
+    )
+
+    assert "[1] Part A, characters 0-10  matched" in out
+    assert "[2] Part A, characters 13-22  MISMATCH" in out
+    assert "departs from the source at character 4 of the span" in out
+    assert "[3] Part A, characters 0-99  OUT OF RANGE" in out
+    assert "fall outside document 0, which has 22" in out
+    assert (
+        "Quotes: 1 of 3 distinct cited spans matched their source exactly. "
+        "2 did not: [2] mismatch, [3] out of range." in out
+    )
+
+
+def test_a_repeated_span_is_counted_once_in_the_summary() -> None:
+    out = summary_of(
+        message_of(
+            text_block("A.", cite(0, 10, text="Alpha text")),
+            text_block(" B.", cite(0, 10, text="Alpha text")),
+        )
+    )
+
+    assert "1 of 1 distinct cited spans matched their source exactly (2 citations;" in out
+
+
+def test_uncited_text_and_thin_blocks_are_reported() -> None:
+    claim = "Alpha rules require every tank to be inspected, logged, and certified annually."
+    out = summary_of(
+        message_of(
+            text_block("In short:"),
+            text_block(f" {claim}", cite(0, 10, text="Alpha text")),
+        )
+    )
+
+    assert "Uncited answer text: " in out
+    assert "Thinly sourced: 1 cited block(s)" in out
+    assert f'[1] "{claim}"' in out
+
+
+def test_the_disclaimer_is_shown_and_verified_is_never_claimed() -> None:
+    out = summary_of(message_of(text_block("Alpha.", cite(0, 10, text="Alpha text"))))
+
+    assert " ".join(out.split()).find(MATCH_DISCLAIMER) >= 0
+    assert "verified" not in out.lower()
 
 
 def test_the_usage_line_shows_every_bucket_and_the_cost() -> None:
@@ -470,7 +529,9 @@ def test_no_cache_activity_is_flagged() -> None:
 @pytest.fixture
 def fake_app(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """``main`` wired to a fake client and an in-memory corpus: no API, no state file."""
-    app: dict[str, Any] = {"message": message_of(text_block("Sumps.", cite(0, 10)))}
+    app: dict[str, Any] = {
+        "message": message_of(text_block("Sumps.", cite(0, 10, text="Alpha text")))
+    }
 
     def build_client() -> FakeClient:
         app["client"] = FakeClient(app["message"], interrupt_after=app.get("interrupt_after"))
@@ -502,7 +563,12 @@ def test_main_prints_the_answer_and_its_sources(
 
     out = capsys.readouterr().out
     assert "Sumps.[1]" in out
-    assert "[1] Part A, characters 0-10" in out
+    assert "[1] Part A, characters 0-10  matched" in out
+
+
+def test_main_exits_nonzero_when_a_quote_fails(fake_app: dict[str, Any]) -> None:
+    fake_app["message"] = message_of(text_block("Sumps.", cite(0, 10, text="fabricated")))
+    assert answer.main(["Q?"]) == 1
 
 
 def test_main_exits_nonzero_on_a_truncated_answer(fake_app: dict[str, Any]) -> None:

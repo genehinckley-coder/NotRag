@@ -12,8 +12,8 @@ answer never looks like a hung terminal. ``stop_reason`` is checked on every
 response: an answer cut off at ``max_tokens`` still carries citations, so
 without the check it would pass for a complete one.
 
-This module lists what each citation points at. Whether the quoted text
-matches the source is plan item 6.
+After the answer, every distinct cited span is checked against the text sent
+(``quotes.py``, plan item 6) and its outcome shown in the sources list.
 
     python answer.py what are the sump requirements for a UST in Illinois
 """
@@ -33,6 +33,7 @@ from rich.console import Console
 from rich.text import Text
 
 from config import (
+    MATCH_DISCLAIMER,
     MAX_TOKENS,
     MODEL,
     OUTPUT_CONFIG,
@@ -42,6 +43,7 @@ from config import (
     PRICE_INPUT_PER_MTOK,
     PRICE_OUTPUT_PER_MTOK,
     SYSTEM_PROMPT,
+    THIN_COVERAGE_FRACTION,
     THINKING,
     TOKEN_CEILING,
 )
@@ -56,6 +58,7 @@ from corpus import (
 from credentials import build_client
 from display import escape_controls
 from extract import ExtractionError
+from quotes import MatchStatus, QuoteReport, build_report, citation_key
 
 #: Longest excerpt of a citation's quoted text shown in the sources list.
 _EXCERPT_CHARS = 160
@@ -168,17 +171,6 @@ def cost_usd(usage: Usage) -> float:
     ) / 1_000_000
 
 
-def citation_key(citation: TextCitation) -> Hashable:
-    """What makes two citations the same source span.
-
-    Item 2 saw one answer cite the same span twice; both share one number.
-    """
-    if isinstance(citation, CitationCharLocation):
-        return (citation.document_index, citation.start_char_index, citation.end_char_index)
-    # Not expected for plain-text documents; keyed on the quote itself.
-    return (citation.type, citation.cited_text)
-
-
 # --- Streaming ---------------------------------------------------------------
 
 
@@ -272,22 +264,36 @@ def stream_answer(
 # --- Summary -----------------------------------------------------------------
 
 
-def render_summary(answer: Answer, console: Console) -> None:
-    """After the streamed answer: any stop warning, the sources, and usage.
+def render_summary(answer: Answer, report: QuoteReport, console: Console) -> None:
+    """After the streamed answer: any stop warning, the checked sources, and usage.
 
     The stop warning cannot go above the answer, which is already on screen by
     the time ``stop_reason`` arrives. It goes first here, before the sources.
+
+    ``report`` is :func:`quotes.build_report` over this answer, so
+    ``report.checks`` lines up with ``answer.sources`` and the ``[n]`` markers.
     """
     if answer.stop_warning:
         console.print()
         console.print(Text(answer.stop_warning, style="bold red"))
 
     console.print()
-    if answer.sources:
+    if report.checks:
         console.rule("Sources", style="dim", align="left")
-        for number, citation in enumerate(answer.sources, start=1):
-            console.print(Text.assemble((f"[{number}] ", _MARKER_STYLE), _source_heading(citation)))
-            console.print(Text(f'    "{_excerpt(citation.cited_text)}"', style="dim"))
+        for number, check in enumerate(report.checks, start=1):
+            console.print(
+                Text.assemble(
+                    (f"[{number}] ", _MARKER_STYLE),
+                    _source_heading(check.citation),
+                    "  ",
+                    _status_label(check.status),
+                )
+            )
+            console.print(Text(f'    "{_excerpt(check.citation.cited_text)}"', style="dim"))
+            if check.detail:
+                console.print(Text(f"    {escape_controls(check.detail)}", style="red"))
+        console.print()
+        _render_quote_report(report, console)
     else:
         console.print(
             Text("No citations: nothing in this answer is tied to a source passage.", style="yellow")
@@ -309,6 +315,59 @@ def usage_line(answer: Answer) -> str:
         f"cache read {usage.cache_read_input_tokens or 0:,} | output "
         f"{usage.output_tokens:,} | ${cost_usd(usage):.2f}"
     )
+
+
+def _render_quote_report(report: QuoteReport, console: Console) -> None:
+    """Quotes matched, each failure by category, and how much of the answer is sourced."""
+    total = len(report.checks)
+    line = (
+        f"Quotes: {report.matched_count} of {total} distinct cited spans matched their "
+        f"source exactly"
+    )
+    if report.citation_count > total:
+        line += f" ({report.citation_count} citations; a span cited more than once counts once)"
+    failures = report.failures
+    if failures:
+        listed = ", ".join(f"[{number}] {check.status.value}" for number, check in failures)
+        line += f". {len(failures)} did not: {listed}."
+    else:
+        line += "."
+    console.print(Text(line, style="bold red" if failures else "green"))
+
+    console.print(
+        Text(
+            f"Uncited answer text: {report.uncited_fraction:.0%} ({report.uncited_chars:,} of "
+            f"{report.answer_chars:,} non-whitespace characters are in blocks with no "
+            f"citation).",
+            style="dim",
+        )
+    )
+
+    thin = report.thin_blocks
+    if thin:
+        console.print(
+            Text(
+                f"Thinly sourced: {len(thin)} cited block(s) whose matched source text is "
+                f"under {THIN_COVERAGE_FRACTION:.0%} of the block's length. A length proxy, "
+                f"not a check: read these claims against their sources.",
+                style="yellow",
+            )
+        )
+        for block in thin:
+            markers = "".join(f"[{number}]" for number in block.source_numbers)
+            console.print(
+                Text.assemble(
+                    f"  {block.fraction:>4.0%} ", (markers, _MARKER_STYLE), f' "{_excerpt(block.text)}"'
+                )
+            )
+
+    console.print(Text(MATCH_DISCLAIMER, style="dim"))
+
+
+def _status_label(status: MatchStatus) -> tuple[str, str]:
+    if status is MatchStatus.MATCHED:
+        return (status.value, "green")
+    return (status.value.upper(), "bold red")
 
 
 def _source_heading(citation: TextCitation) -> str:
@@ -377,8 +436,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Could not record the corpus fingerprint: {exc}", file=sys.stderr)
         return 1
 
-    render_summary(answer, console)
-    return 0 if answer.stop_warning is None else 1
+    report = build_report(
+        answer.sources, answer.message.content, [document.text for document in corpus.documents]
+    )
+    render_summary(answer, report, console)
+    return 0 if answer.stop_warning is None and not report.failures else 1
 
 
 def _render_preamble(
