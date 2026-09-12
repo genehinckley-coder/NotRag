@@ -1,5 +1,5 @@
 # DocQA ("NotRag") — Question Answering Over a Local Document Folder
-_Generated: 2026-09-11 · Revised after plan review · Item 2, 3, 4 and 5 findings added 2026-09-12_
+_Generated: 2026-09-11 · Revised after plan review · Item 2, 3, 4, 5 and 6 findings added 2026-09-12_
 
 ## Goal
 
@@ -387,9 +387,8 @@ Findings that change later items:
 - Item 7 can reuse `answer.cost_usd` and `answer.cache_warning`. The billed cache size is
   now measured (above).
 - Item 8's system prompt test and live smoke test have landed.
-- Open: the system prompt's example, Section 175.410(h)(1), is a real sump provision and
-  may nudge unrelated questions toward it. A neutral example costs one cold write (~$2).
-  Not changed.
+- The system prompt's example, Section 175.410(h)(1), is a real sump provision and may
+  nudge unrelated questions toward it. *Replaced in item 6.*
 
 ### 6. Quote-match reporter (no LLM call)
 **Why:** Nearly free: native citations return `cited_text` plus `char_location` offsets
@@ -432,9 +431,52 @@ REPL turn on a mismatch, the exact case this item exists to report on. Render qu
 through `display.escape_controls`, then `rich`'s `Text`, never bare `print`. Rich alone is
 not enough: item 5 measured that it passes ESC through, so escape sequences in source text
 could rewrite the terminal.
+Also in this item: replace the system prompt's example reference, Section 175.410(h)(1). It
+is a real sump provision and might bias unrelated questions toward it.
 **Depends on:** Items 4, 5. Needs the exact in-memory strings sent, indexed in send order.
 **Risks:** Already stated in **Goal**: this proves provenance, not entailment.
 **Open questions:** None.
+
+**Result (2026-09-12): built.** Module `quotes.py`, tests `tests/test_quotes.py` (33 pass,
+offline), branch `item-6-quote-reporter`. The reporter makes no API call, so there was no
+live run. Because the system prompt changed (below), the next live question pays one cold
+write.
+- Five outcomes rather than four: `matched`, `mismatch`, `out of range`, `degenerate`, and
+  `not checkable` for a citation without character offsets. Plain-text documents should
+  never produce that last one; it is reported rather than raised. Range is checked before
+  slicing. A test pins the trap: a span running past the end of the document, whose
+  silently clipped slice equals the quote.
+- `degenerate` counts non-whitespace characters, so a whitespace-only span is degenerate
+  as well as an empty or short one.
+- A mismatch says where the quote departs from the span, and whether the quote appears
+  verbatim elsewhere in the document and how far from the cited start. That tells an
+  offset error apart from a quote that is not in the document at all.
+- Each distinct span is checked and counted once, keyed by `citation_key`, which moved from
+  `answer.py` to `quotes.py`. The summary gives distinct spans and total citations.
+- **Coverage, decided 2026-09-12.** The measure written above cannot be computed:
+  citations carry no position within the answer block, and the block paraphrases its
+  source. Two figures replace it:
+  1. Per cited block, a length proxy: non-whitespace characters in its matched spans
+     (overlaps merged, failed spans counting nothing) over the block's non-whitespace
+     characters, capped at 100%. Blocks under `config.THIN_COVERAGE_FRACTION` (50%) are
+     listed as thinly sourced.
+  2. Per answer, the share of answer text in blocks with no citation.
+- Rendering stays in `answer.py`. Each entry in the existing sources list gains its status
+  and, on failure, the reason. Below the list come the quotes-matched line, the uncited
+  share, the thin blocks, and `MATCH_DISCLAIMER`. `answer.main` now exits 1 when any quote
+  fails, as it already did on a stop warning.
+- A test parses `quotes.py` and fails on any `assert` statement.
+- **System prompt example replaced.** "for example Section 175.410(h)(1)" became "down to the
+  deepest level that applies, such as (b)(2)(A), not the Section number alone". The new
+  wording names no real section. The pinned hash is updated. The sump question has not been
+  re-run against the new prompt; that run pays the ~$2 cold write.
+
+Findings that change later items:
+- Item 7: `render_summary` prints `MATCH_DISCLAIMER` after every answer, which suits the
+  one-question CLI. The REPL must print it once per session. `render_summary` now takes the
+  report as well, built by `quotes.build_report(answer.sources, answer.message.content,
+  texts)`.
+- Item 8's quote reporter tests have landed.
 
 ### 7. REPL loop, caching, and cost display
 **Why:** The chosen interface, and where the cached corpus pays off — the expensive prefix
@@ -500,7 +542,7 @@ mode and was untested in the first draft.
 - Quote reporter: exact citation matches; off-by-one offset reports as mismatch;
   out-of-range offset and out-of-range `document_index` each report as their own category
   rather than raising or masquerading as a mismatch; degenerate zero-length span rejected;
-  a span cited twice counts once.
+  a span cited twice counts once. *Landed with item 6 in `tests/test_quotes.py`.*
 - Size guard: **make the token counter an injectable dependency** so the abort can be
   asserted at ceiling+1 and its absence at ceiling−1 without a live API call.
 - Assembly determinism: same inputs produce a byte-identical corpus and a stable
