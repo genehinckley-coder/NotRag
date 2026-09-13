@@ -446,9 +446,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         client = build_client()
     except (FileNotFoundError, ValueError) as exc:
         # credentials.py never puts the key itself in an error message.
-        print(f"Cannot load the API key: {exc}", file=sys.stderr)
+        print(f"Cannot load the API key: {escape_controls(str(exc))}", file=sys.stderr)
         return 2
 
+    # Exception text can carry an API response body or a file name from disk,
+    # so it is escaped like any other untrusted text.
     try:
         corpus, check = load_corpus(api_token_counter(client, system=SYSTEM_PROMPT))
         render_preamble(console, corpus, check)
@@ -460,22 +462,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Interrupted. The answer is incomplete and was not kept.", file=sys.stderr)
         return 130
     except (ExtractionError, CorpusTooLargeError) as exc:
-        print(f"Corpus assembly failed: {exc}", file=sys.stderr)
+        print(f"Corpus assembly failed: {escape_controls(str(exc))}", file=sys.stderr)
         return 1
     except anthropic.AuthenticationError:
         print("Authentication failed. Check the key file in config.API_KEY_PATH.", file=sys.stderr)
         return 2
     except anthropic.RateLimitError as exc:
-        print(f"Rate limited or out of quota: {exc.message}", file=sys.stderr)
+        print(f"Rate limited or out of quota: {escape_controls(exc.message)}", file=sys.stderr)
         return 2
     except anthropic.APIStatusError as exc:
-        print(f"API error {exc.status_code}: {exc.message}", file=sys.stderr)
+        print(f"API error {exc.status_code}: {escape_controls(exc.message)}", file=sys.stderr)
         return 2
     except anthropic.APIConnectionError:
         print("Network error reaching the API.", file=sys.stderr)
         return 2
     except OSError as exc:
-        print(f"Could not record the corpus fingerprint: {exc}", file=sys.stderr)
+        print(f"Could not record the corpus fingerprint: {escape_controls(str(exc))}", file=sys.stderr)
         return 1
 
     report = build_report(

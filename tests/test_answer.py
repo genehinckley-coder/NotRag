@@ -15,6 +15,8 @@ from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any
 
+import anthropic
+import httpx2
 import pytest
 from anthropic.types import (
     CacheCreation,
@@ -45,7 +47,7 @@ from config import (
     THINKING,
 )
 from corpus import Corpus, FingerprintCheck, FingerprintStatus, assemble_corpus
-from extract import ExtractedDocument
+from extract import ExtractedDocument, ExtractionError
 from quotes import build_report
 
 #: SHA-256 of ``config.SYSTEM_PROMPT``. The system prompt renders before the
@@ -121,13 +123,36 @@ def message_of(
     )
 
 
+def api_error(kind: type[anthropic.APIStatusError], status: int, message: str) -> Exception:
+    """An SDK status error, built the way the SDK builds one.
+
+    The SDK vendors its HTTP client as ``httpx2``; its exceptions are typed
+    against that, not against ``httpx``.
+    """
+    request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+    return kind(message, response=httpx2.Response(status, request=request), body=None)
+
+
 def events_for(message: Message) -> list[Any]:
-    """The stream events the SDK would yield for ``message``.
+    """The stream events ``client.messages.stream`` would yield for ``message``.
+
+    Mirrors ``anthropic.lib.streaming._messages.build_events``: every raw
+    event is passed through, and each raw ``content_block_delta`` is followed
+    by the ``text``, ``thinking``, ``citation`` or ``signature`` event derived
+    from it. A renderer that also printed the raw deltas would print every
+    answer twice.
 
     A text block's citation events come first and its text arrives in two
     deltas: the order in which a marker printed on arrival would be misplaced.
     """
-    events: list[Any] = []
+
+    def delta(index: int, derived: SimpleNamespace, **fields: Any) -> list[SimpleNamespace]:
+        raw = SimpleNamespace(
+            type="content_block_delta", index=index, delta=SimpleNamespace(**fields)
+        )
+        return [raw, derived]
+
+    events: list[Any] = [SimpleNamespace(type="message_start", message=message)]
     for index, block in enumerate(message.content):
         events.append(
             SimpleNamespace(
@@ -135,15 +160,38 @@ def events_for(message: Message) -> list[Any]:
             )
         )
         if block.type == "thinking":
-            events.append(SimpleNamespace(type="thinking", thinking=block.thinking))
+            events += delta(
+                index,
+                SimpleNamespace(type="thinking", thinking=block.thinking),
+                type="thinking_delta",
+                thinking=block.thinking,
+            )
+            events += delta(
+                index,
+                SimpleNamespace(type="signature", signature=block.signature),
+                type="signature_delta",
+                signature=block.signature,
+            )
         elif block.type == "text":
             for citation in block.citations or []:
-                events.append(SimpleNamespace(type="citation", citation=citation))
+                events += delta(
+                    index,
+                    SimpleNamespace(type="citation", citation=citation),
+                    type="citations_delta",
+                    citation=citation,
+                )
             half = len(block.text) // 2
-            for delta in (block.text[:half], block.text[half:]):
-                if delta:
-                    events.append(SimpleNamespace(type="text", text=delta))
+            for fragment in (block.text[:half], block.text[half:]):
+                if fragment:
+                    events += delta(
+                        index,
+                        SimpleNamespace(type="text", text=fragment),
+                        type="text_delta",
+                        text=fragment,
+                    )
         events.append(SimpleNamespace(type="content_block_stop", index=index, content_block=block))
+    events.append(SimpleNamespace(type="message_delta", delta=SimpleNamespace(stop_reason=message.stop_reason)))
+    events.append(SimpleNamespace(type="message_stop", message=message))
     return events
 
 
@@ -391,6 +439,16 @@ def test_an_interrupt_propagates_and_closes_the_stream() -> None:
     assert client.stream.closed
 
 
+def test_a_citation_only_in_the_final_message_still_becomes_a_source() -> None:
+    # The stream's stop event shows the block uncited; the final message does not.
+    client = FakeClient(message_of(text_block("Sumps.", cite(0, 10))))
+    client.stream.events = events_for(message_of(text_block("Sumps.")))
+
+    result = stream_answer(client, {"model": MODEL}, make_console())  # type: ignore[arg-type]
+
+    assert [(c.start_char_index, c.end_char_index) for c in result.sources] == [(0, 10)]
+
+
 # --- Summary -----------------------------------------------------------------
 
 
@@ -588,6 +646,33 @@ def test_main_refuses_an_empty_question_without_calling_the_api(
         answer.main(["   "])
     assert exit_info.value.code == 2
     assert "client" not in fake_app
+
+
+@pytest.mark.parametrize(
+    ("error", "exit_code"),
+    [
+        (api_error(anthropic.RateLimitError, 429, "slow \x1b[31mdown"), 2),
+        (api_error(anthropic.InternalServerError, 500, "slow \x1b[31mdown"), 2),
+        (ExtractionError("slow \x1b[31mdown"), 1),
+    ],
+    ids=["rate-limit", "api-status", "extraction"],
+)
+def test_main_escapes_error_text(
+    fake_app: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error: Exception,
+    exit_code: int,
+) -> None:
+    def failing_load(count_tokens: Any) -> None:
+        raise error
+
+    monkeypatch.setattr(answer, "load_corpus", failing_load)
+
+    assert answer.main(["Q?"]) == exit_code
+    err = capsys.readouterr().err
+    assert "\x1b" not in err
+    assert "slow \\x1b[31mdown" in err
 
 
 # --- Live --------------------------------------------------------------------

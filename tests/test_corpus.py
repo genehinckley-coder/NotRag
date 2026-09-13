@@ -7,14 +7,17 @@ extract ``admincode/`` and take a few seconds.
 
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import anthropic
 import pytest
 
+import corpus as corpus_module
 from config import CORPUS_CACHE_TTL, DOCUMENT_LABELS, PRICE_CACHE_WRITE_1H_PER_MTOK, TOKEN_CEILING
 from corpus import (
     Corpus,
@@ -25,10 +28,12 @@ from corpus import (
     build_document_blocks,
     compare_with_previous,
     describe_check,
+    fingerprint_blocks,
     load_corpus,
     record_state,
 )
 from extract import ExtractedDocument
+from test_answer import api_error
 
 ALPHA = ExtractedDocument("a.htm", "Part A", "Alpha text.\n\na) First.")
 BRAVO = ExtractedDocument("b.htm", "Part B", "Bravo text.")
@@ -63,14 +68,20 @@ def state_file(tmp_path: Path) -> Path:
 # --- Document blocks ---------------------------------------------------------
 
 
-def test_document_block_has_the_production_shape() -> None:
-    assert build_document_blocks([ALPHA, BRAVO])[0] == {
-        "type": "document",
-        "source": {"type": "text", "media_type": "text/plain", "data": ALPHA.text},
-        "title": "Part A",
-        "context": "Source file: a.htm",
-        "citations": {"enabled": True},
-    }
+def test_every_document_block_has_the_production_shape() -> None:
+    blocks = build_document_blocks([ALPHA, BRAVO])
+
+    # The breakpoint on the last block is the next test's subject.
+    assert [{key: value for key, value in block.items() if key != "cache_control"} for block in blocks] == [
+        {
+            "type": "document",
+            "source": {"type": "text", "media_type": "text/plain", "data": document.text},
+            "title": document.label,
+            "context": f"Source file: {document.filename}",
+            "citations": {"enabled": True},
+        }
+        for document in (ALPHA, BRAVO)
+    ]
 
 
 def test_only_the_last_block_carries_the_corpus_breakpoint() -> None:
@@ -125,6 +136,26 @@ def test_any_change_to_the_documents_changes_the_fingerprint(
 def test_context_template_is_part_of_the_fingerprint(monkeypatch: pytest.MonkeyPatch) -> None:
     before = corpus_of(ALPHA).fingerprint
     monkeypatch.setattr("corpus.DOCUMENT_CONTEXT_TEMPLATE", "File: {filename}")
+    assert corpus_of(ALPHA).fingerprint != before
+
+
+def test_every_field_of_every_block_is_fingerprinted() -> None:
+    # Every field is cache-affecting, the breakpoint and citation setting
+    # included, so a change to any one of them must change the fingerprint.
+    blocks = build_document_blocks([ALPHA, BRAVO])
+    before = fingerprint_blocks(blocks)
+
+    for index, block in enumerate(blocks):
+        for key in block:
+            altered = copy.deepcopy(blocks)
+            altered[index][key] = "altered"
+            assert fingerprint_blocks(altered) != before, (index, key)
+    assert fingerprint_blocks(blocks[::-1]) != before
+
+
+def test_the_corpus_ttl_is_part_of_the_fingerprint(monkeypatch: pytest.MonkeyPatch) -> None:
+    before = corpus_of(ALPHA).fingerprint
+    monkeypatch.setattr("corpus.CORPUS_CACHE_TTL", "5m")
     assert corpus_of(ALPHA).fingerprint != before
 
 
@@ -191,7 +222,9 @@ def test_api_counter_counts_the_blocks_followed_by_a_question() -> None:
     [message] = request["messages"]
     assert message["role"] == "user"
     assert message["content"][:-1] == blocks
-    assert message["content"][-1]["type"] == "text"
+    question = message["content"][-1]
+    # The API rejects an empty text block, so the placeholder must carry text.
+    assert question["type"] == "text" and question["text"].strip()
 
 
 def test_api_counter_includes_the_system_prompt_when_given() -> None:
@@ -277,6 +310,27 @@ def test_unreadable_state_is_reported_not_raised(state_file: Path, content: str)
     assert check.details
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("chars", "oops"), ("filename", ["a.htm"]), ("label", None), ("text_sha256", 5)],
+)
+def test_a_mistyped_document_field_is_reported_not_raised(
+    state_file: Path, field: str, value: Any
+) -> None:
+    # A hand-edited state file: every key present, one of the wrong type. The
+    # changed text below makes the comparison describe the document, which is
+    # where a wrong type would raise.
+    record_state(corpus_of(ALPHA), state_file, lxml_version="6.1.3")
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    state["documents"][0][field] = value
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    changed = corpus_of(replace(ALPHA, text="Alpha text, amended."))
+    check = compare_with_previous(changed, state_file, lxml_version="6.1.3")
+
+    assert check.status is FingerprintStatus.UNREADABLE
+
+
 def test_recording_replaces_an_unreadable_state_file(state_file: Path) -> None:
     state_file.write_text("{not json", encoding="utf-8")
     record_state(corpus_of(ALPHA), state_file)
@@ -315,3 +369,21 @@ def test_oversized_real_corpus_records_no_fingerprint(state_file: Path) -> None:
     with pytest.raises(CorpusTooLargeError):
         load_corpus(FixedCounter(TOKEN_CEILING + 1), state_file=state_file)
     assert not state_file.exists()
+
+
+# --- Command line ------------------------------------------------------------
+
+
+def test_main_escapes_error_text(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def failing_load(count_tokens: Any, **kwargs: Any) -> None:
+        raise api_error(anthropic.InternalServerError, 500, "over\x1b[31mloaded")
+
+    monkeypatch.setattr(corpus_module, "build_client", lambda: FakeClient())
+    monkeypatch.setattr(corpus_module, "load_corpus", failing_load)
+
+    assert corpus_module.main() == 2
+    err = capsys.readouterr().err
+    assert "\x1b" not in err
+    assert "over\\x1b[31mloaded" in err
