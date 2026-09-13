@@ -70,6 +70,14 @@ CONTEXT_WINDOW: Final[int] = 1_000_000
 #: Fraction of CONTEXT_WINDOW at which the REPL suggests ``/reset``.
 CONTEXT_WARN_FRACTION: Final[float] = 0.70
 
+#: How far a turn's cache read may fall short of the expected corpus prefix
+#: before the REPL calls it a miss, as a fraction of that prefix (plan item 7).
+#: Prefix matching is all-or-nothing at block boundaries, so a real miss loses
+#: the whole prefix or a whole document -- tens of thousands of tokens. A
+#: shortfall of a few hundred instead means the expected figure absorbed a
+#: conversation-tail read, which is not a miss and must not be reported as one.
+CACHE_READ_TOLERANCE_FRACTION: Final[float] = 0.01
+
 #: Citation spans with fewer non-whitespace characters than this are rejected
 #: as degenerate (plan item 6): an empty span matches an empty quote trivially.
 MIN_CITATION_LENGTH: Final[int] = 8

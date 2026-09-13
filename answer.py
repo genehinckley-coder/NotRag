@@ -33,6 +33,7 @@ from rich.console import Console
 from rich.text import Text
 
 from config import (
+    CONVERSATION_CACHE_TTL,
     MATCH_DISCLAIMER,
     MAX_TOKENS,
     MODEL,
@@ -50,6 +51,7 @@ from config import (
 from corpus import (
     Corpus,
     CorpusTooLargeError,
+    FingerprintCheck,
     FingerprintStatus,
     api_token_counter,
     describe_check,
@@ -82,12 +84,13 @@ class Answer:
 # --- Request -----------------------------------------------------------------
 
 
-def build_request(corpus: Corpus, question: str) -> dict[str, Any]:
-    """The keyword arguments for ``client.messages.stream``.
+def first_turn(corpus: Corpus, question: str) -> dict[str, Any]:
+    """``messages[0]``: every document block, then the question.
 
-    Everything before the question -- the system prompt, then the document
-    blocks -- is identical on every call, which is what lets the corpus cache
-    hit. The question is the only part that varies.
+    The API requires the first message to be a user message, so the documents
+    and the first question necessarily share it. The blocks are rebuilt from
+    ``corpus`` every time, so nothing a previous turn did can alter the cached
+    prefix.
 
     Raises:
         ValueError: ``question`` is empty or only whitespace. The API rejects
@@ -97,18 +100,45 @@ def build_request(corpus: Corpus, question: str) -> dict[str, Any]:
     if not question:
         raise ValueError("The question is empty")
     return {
+        "role": "user",
+        "content": [*corpus.document_blocks(), {"type": "text", "text": question}],
+    }
+
+
+def request_kwargs(
+    messages: list[dict[str, Any]], *, tail_cache: bool = False
+) -> dict[str, Any]:
+    """The keyword arguments for ``client.messages.stream`` around ``messages``.
+
+    Everything before the question -- the system prompt, then the document
+    blocks -- is identical on every call, which is what lets the corpus cache
+    hit.
+
+    Args:
+        messages: The conversation so far, ending in the new user message.
+        tail_cache: Add a top-level breakpoint covering the conversation tail,
+            at the shorter ``config.CONVERSATION_CACHE_TTL``. Item 2's spike
+            confirmed it produces a tail read alongside the 1-hour document
+            breakpoint. Only the REPL needs it; one question has no tail.
+    """
+    kwargs: dict[str, Any] = {
         "model": MODEL,
         "max_tokens": MAX_TOKENS,
         "system": SYSTEM_PROMPT,
-        "messages": [
-            {
-                "role": "user",
-                "content": [*corpus.document_blocks(), {"type": "text", "text": question}],
-            }
-        ],
+        "messages": messages,
         "thinking": dict(THINKING),
         "output_config": dict(OUTPUT_CONFIG),
     }
+    if tail_cache:
+        # The shorter TTL lands after the 1h document breakpoint, as the API
+        # requires.
+        kwargs["cache_control"] = {"type": "ephemeral", "ttl": CONVERSATION_CACHE_TTL}
+    return kwargs
+
+
+def build_request(corpus: Corpus, question: str) -> dict[str, Any]:
+    """One question against the corpus, as a complete request."""
+    return request_kwargs([first_turn(corpus, question)])
 
 
 # --- Response checks ---------------------------------------------------------
@@ -157,9 +187,12 @@ def cost_usd(usage: Usage) -> float:
     """
     creation = usage.cache_creation
     written = usage.cache_creation_input_tokens or 0
-    # Without a TTL breakdown, price the whole write at the 1-hour rate: it is
-    # the only breakpoint this request carries, and the higher of the two
-    # prices, so the figure is never low.
+    # A REPL request carries two breakpoints: the 1-hour corpus prefix and the
+    # 5-minute conversation tail. Without a TTL breakdown there is no way to
+    # tell them apart, so the whole write is priced at the 1-hour rate -- the
+    # higher of the two, and the one the corpus actually pays, so the figure
+    # errs high rather than low. Item 2 measured the breakdown as present in
+    # practice; this is the defensive path.
     write_1h = creation.ephemeral_1h_input_tokens if creation else written
     write_5m = creation.ephemeral_5m_input_tokens if creation else 0
     return (
@@ -264,7 +297,9 @@ def stream_answer(
 # --- Summary -----------------------------------------------------------------
 
 
-def render_summary(answer: Answer, report: QuoteReport, console: Console) -> None:
+def render_summary(
+    answer: Answer, report: QuoteReport, console: Console, *, show_disclaimer: bool = True
+) -> None:
     """After the streamed answer: any stop warning, the checked sources, and usage.
 
     The stop warning cannot go above the answer, which is already on screen by
@@ -272,6 +307,11 @@ def render_summary(answer: Answer, report: QuoteReport, console: Console) -> Non
 
     ``report`` is :func:`quotes.build_report` over this answer, so
     ``report.checks`` lines up with ``answer.sources`` and the ``[n]`` markers.
+
+    Args:
+        show_disclaimer: Print ``config.MATCH_DISCLAIMER`` below the report.
+            The one-question CLI shows it every time; the REPL shows it once
+            per session (plan item 7).
     """
     if answer.stop_warning:
         console.print()
@@ -298,6 +338,8 @@ def render_summary(answer: Answer, report: QuoteReport, console: Console) -> Non
         console.print(
             Text("No citations: nothing in this answer is tied to a source passage.", style="yellow")
         )
+    if show_disclaimer:
+        console.print(Text(MATCH_DISCLAIMER, style="dim"))
 
     usage = answer.message.usage
     warning = cache_warning(usage)
@@ -361,8 +403,6 @@ def _render_quote_report(report: QuoteReport, console: Console) -> None:
                 )
             )
 
-    console.print(Text(MATCH_DISCLAIMER, style="dim"))
-
 
 def _status_label(status: MatchStatus) -> tuple[str, str]:
     if status is MatchStatus.MATCHED:
@@ -411,7 +451,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         corpus, check = load_corpus(api_token_counter(client, system=SYSTEM_PROMPT))
-        _render_preamble(console, corpus, check.status, describe_check(check, corpus), question)
+        render_preamble(console, corpus, check)
+        console.print()
+        console.print(Text(f"Q: {escape_controls(question)}", style="bold"))
         answer = stream_answer(client, build_request(corpus, question), console)
     except KeyboardInterrupt:
         console.print()
@@ -443,9 +485,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0 if answer.stop_warning is None and not report.failures else 1
 
 
-def _render_preamble(
-    console: Console, corpus: Corpus, status: FingerprintStatus, check: str, question: str
-) -> None:
+def render_preamble(console: Console, corpus: Corpus, check: FingerprintCheck) -> None:
+    """The corpus size, what it costs to cache, and the fingerprint comparison."""
     write = corpus.tokens * PRICE_CACHE_WRITE_1H_PER_MTOK / 1_000_000
     read = corpus.tokens * PRICE_CACHE_READ_PER_MTOK / 1_000_000
     console.print(
@@ -457,10 +498,10 @@ def _render_preamble(
             style="dim",
         )
     )
-    warn = status in (FingerprintStatus.CHANGED, FingerprintStatus.UNREADABLE)
-    console.print(Text(f"Fingerprint: {check}", style="yellow" if warn else "dim"))
-    console.print()
-    console.print(Text(f"Q: {escape_controls(question)}", style="bold"))
+    warn = check.status in (FingerprintStatus.CHANGED, FingerprintStatus.UNREADABLE)
+    console.print(
+        Text(f"Fingerprint: {describe_check(check, corpus)}", style="yellow" if warn else "dim")
+    )
 
 
 if __name__ == "__main__":
