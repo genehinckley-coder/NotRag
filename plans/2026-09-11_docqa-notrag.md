@@ -1,5 +1,6 @@
 # DocQA ("NotRag") — Question Answering Over a Local Document Folder
-_Generated: 2026-09-11 · Revised after plan review · Item 2, 3, 4, 5 and 6 findings added 2026-09-12_
+_Generated: 2026-09-11 · Revised after plan review · Item 2, 3, 4, 5 and 6 findings added 2026-09-12 ·
+Item 7 findings added 2026-09-13_
 
 ## Goal
 
@@ -530,6 +531,76 @@ is written once and read cheaply for every follow-up.
 tail auto-caching keeps the cost of not resetting low.
 **Open questions:** None.
 
+**Result (2026-09-13): built, and a three-question live session passes.** Module `repl.py`,
+tests `tests/test_repl.py` (53 pass, offline), branch `item-7-repl`. `python repl.py` starts
+a session.
+- **Live run**, three questions for **$2.56** total. Turn 1, the sump question from **Goal**:
+  67 s, a cold 199,763-token write, 6,358 output tokens, 42 of 42 quotes matched, $2.16.
+  Turn 2, a follow-up in the same conversation: **read 199,745**, wrote a 6,338-token tail,
+  23 of 23 matched, $0.23. Turn 3, after a `/reset`: **read 199,745** again, 18 of 18
+  matched, $0.18. No cache-miss and no context warnings fired.
+- **The cache hit after `/reset` is the load-bearing result.** It shows the rebuilt
+  `messages[0]` is byte-identical to the original against the real API, not only under the
+  test's serialization.
+- **Taking the baseline from the 1-hour bucket alone is what avoids a false miss.** Turn 1
+  billed 199,763 tokens of writes, 199,745 of them the 1-hour corpus prefix and 18 the
+  5-minute tail. Against the *total*, turn 2's read of 199,745 would have been 18 short and
+  reported a CACHE MISS on the first follow-up of every session.
+- Turn 2 referred to "those sumps" and resolved it against turn 1, so the replayed assistant
+  turn -- citations and thinking signatures intact, the empty text block dropped -- was
+  accepted. That is the 400 this item's invariants exist to prevent, not reproduced.
+- `answer.py` was split so both entry points share one request shape: `first_turn` builds
+  `messages[0]` from the corpus plus a question, and `request_kwargs` wraps a message list
+  in the model settings, adding the top-level 5-minute tail breakpoint on request.
+  `build_request` is now those two composed. `_render_preamble` became `render_preamble`
+  and no longer prints the question.
+- `render_summary` takes `show_disclaimer`. `MATCH_DISCLAIMER` moved out of the quote
+  report so it also prints when an answer has no citations at all, which is when it matters
+  most. The REPL passes False after the first answer, closing item 6's finding.
+- `Session` holds the conversation, the cache baseline and the session bill. `commit` runs
+  only after `stream_answer` returns, so an interrupt or any API error leaves `messages`
+  exactly as it was. A test drives six failure kinds through a live conversation and
+  asserts the roles still alternate and the next turn still sends a valid request.
+- `replayable()` drops only empty text blocks; thinking blocks keep their signatures and
+  text blocks their citations, asserted by identity rather than equality.
+- `/reset` clears `messages` so the next question rebuilds `messages[0]` from the corpus. A
+  test asserts the rebuilt first message holds exactly one text block carrying the new
+  question, and that the prefix serializes byte-identically across a reset.
+- **Cache check, refined.** The text above says to compare each turn's read against the
+  first turn's billed write. A first turn can also *read* its prefix, and that read covers
+  the question after the breakpoint when an earlier session cached the identical first
+  turn, so the baseline is an upper bound, not an exact figure. Comparing strictly reports
+  a false CACHE MISS on the first turn after a `/reset`. The comparison now allows
+  `config.CACHE_READ_TOLERANCE_FRACTION` (1%): prefix matching is all-or-nothing at block
+  boundaries, so a real miss loses the whole prefix or a whole document, far past 1%.
+- The miss message separates an expired 1-hour entry (this turn rewrote the prefix; later
+  turns hit again) from a prefix that no longer matches (every turn now pays full input
+  price). Only the second needs acting on.
+- **Context growth is per-request, not cumulative.** The text above says to track
+  cumulative input tokens. The whole conversation is resent every turn, so the sum across
+  turns is not what fills the window; `input + cache write + cache read` for the latest
+  request is. That is what the 70% warning measures.
+- `/reload` replaces the corpus only if extraction, the size guard and the fingerprint
+  write all succeed; on any failure the loaded corpus and the conversation are untouched. A
+  reload that changes the fingerprint also clears the cache baseline, which would otherwise
+  report a miss on every turn after.
+- `/help` was added to the four commands above. `/cost` prices the three input buckets
+  separately and shows the last request against the window.
+- Errors are handled most-specific-first, per turn, without ending the session: auth, rate
+  limit and quota, 400 with credit exhaustion named separately, other API status, and
+  connection. Every message goes through `display.escape_controls`, so a 400 body cannot
+  drive the terminal.
+- `answer.cost_usd`'s fallback comment was wrong as of this item: a REPL request carries two
+  breakpoints, not one. The behavior is unchanged and still right -- an unbroken-down write
+  is priced at the 1-hour rate, so the figure errs high rather than low.
+
+Findings that change later items:
+- Item 8's REPL state tests have landed.
+- Item 6's cold write is paid: the live run above wrote the corpus afresh under the new
+  system prompt, and the following turns read it.
+- A `/cost` typed as the last command before exit prints the session summary twice, since
+  the exit summary is unconditional. Cosmetic; left as is.
+
 ### 8. Tests
 **Why:** Extraction is structural and regresses silently; the quote reporter is the
 correctness story; the size guard is described as protecting against the worst failure
@@ -555,6 +626,9 @@ mode and was untested in the first draft.
 - REPL state: a mocked failing client leaves `messages` in a valid alternating state; a
   post-`/reset` `messages[0]` contains exactly one text block; an assistant reply ending in
   an empty text block is committed without it, with every other block unchanged.
+  *Landed with item 7 in `tests/test_repl.py`. The failing-client test is parametrized over
+  six failure kinds, including a mid-stream `KeyboardInterrupt`, and also asserts the turn
+  after the failure still sends a valid conversation.*
 - One end-to-end smoke test asking the sump question and asserting §175.410 appears —
   marked and **skipped by default**, since it costs real money. *Landed with item 5: run
   it with `NOTRAG_LIVE=1 pytest -m live`. It calls `answer.main`, so it also records the
