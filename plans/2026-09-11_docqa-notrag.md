@@ -1,6 +1,6 @@
 # DocQA ("NotRag") — Question Answering Over a Local Document Folder
 _Generated: 2026-09-11 · Revised after plan review · Item 2, 3, 4, 5 and 6 findings added 2026-09-12 ·
-Item 7 findings added 2026-09-13_
+Item 7 and 8 findings added 2026-09-13_
 
 ## Goal
 
@@ -636,6 +636,61 @@ mode and was untested in the first draft.
 **Depends on:** Items 3, 6, 7.
 **Risks:** None.
 **Open questions:** None.
+
+**Result (2026-09-13): the whole suite reviewed adversarially; 33 tests added, two source
+bugs fixed.** Branch `item-8-tests`. 229 pass offline, plus the one `live` test. New file
+`tests/test_credentials.py` (13 tests).
+- **Method.** Copilot CLI (`gpt-5.6-luna`, read-only) reviewed every test file against the
+  source and this plan and returned 13 findings; a separate read of the suite added more.
+  Every claim was then checked by mutation: apply one plausible bug to a scratch copy of the
+  repository, run the suite, and see whether anything fails. Of 16 such bugs tried against
+  the old suite, 14 went undetected. Against the new suite, 26 of 27 are caught; the one
+  survivor cannot be (see **Rejected**).
+- **Source bugs fixed:**
+  1. `compare_with_previous` promises never to raise on a malformed state file, but a
+     document field of the wrong type -- a hand-edited `"chars": "oops"` -- passed
+     validation and raised `ValueError` while the change was being described.
+     `_parse_state` now checks each recorded document field's type.
+  2. Exception text reached the terminal unescaped in `/reload` and in all three `main()`
+     functions. `str()` of an `APIStatusError` is `Error code: N - <response body>`, and an
+     `ExtractionError` names files on disk. Item 7's "every message goes through
+     `display.escape_controls`" held for turns only; it now holds wherever exception text is
+     printed.
+- **Gaps closed**, each shown first by a surviving mutant:
+  - `credentials.py` had no tests. Now covered: BOM and CRLF, annotation lines, the default
+    path, missing, empty, keyless, two-key and whitespace-split files, no key text in any
+    error message, `redact`, and `build_client` passing the key explicitly with `os.environ`
+    unchanged. No test reads the real key.
+  - The failed-turn test asserted only that *something* printed, so a REPL that lost its
+    rate-limit or authentication branch and fell through to the generic message passed.
+    Each failure kind now asserts its own message.
+  - Nothing checked the session's per-bucket totals, or that a cold turn's request size
+    includes its cache write. The cache baseline gained a first turn split between write and
+    read, and a read exactly at the tolerance boundary.
+  - `/reload` failure was tested for `ExtractionError` only; now all five caught kinds, each
+    asserting that the corpus, the conversation and the cache baseline are unchanged.
+  - Only the first document block's full shape was asserted. Every block is now checked,
+    every field of every block (TTL included) is shown to change the fingerprint, and the
+    token counter's placeholder question must carry text.
+  - `test_documents_are_checked_against_the_corpus_actually_loaded` was vacuous: it asserted
+    `"matched" in out`, which the quote summary prints even on a mismatch, and passed with
+    the REPL checking quotes against the wrong documents. Replaced by a test that can match
+    only against the session's own corpus.
+  - `stream_answer`'s pass over the final message, which numbers any citation the stream
+    events missed, had no test.
+- **The stream fake now mirrors the SDK more closely.** Copilot's highest-ranked finding was
+  that the fake invents events the SDK never yields. That is wrong: `MessageStream` derives
+  `text`, `thinking` and `citation` events from the raw deltas and gives `content_block_stop`
+  its `content_block` (`build_events` in `anthropic/lib/streaming/_messages.py`), which is why
+  items 5 and 7's live runs rendered correctly. What the fake did omit are the raw events
+  passed through alongside them. It now emits those too, so a renderer that also printed raw
+  `content_block_delta` text, showing every answer twice, fails four tests.
+- **Rejected:** removing `no_network=True` from the lxml parser changes nothing, because
+  lxml's `HTMLParser` already defaults to it, so no test can detect it. The argument stays as
+  documentation. The live test writing the real `.notrag_state.json` is intended, as
+  recorded above: it records exactly what a real run would.
+- `api_error`, the SDK-shaped exception builder, moved from `test_repl.py` to
+  `test_answer.py` so that `test_corpus.py` can share it.
 
 ## Sequencing
 
