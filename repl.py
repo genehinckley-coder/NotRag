@@ -404,23 +404,31 @@ def reload_corpus(client: anthropic.Anthropic, session: Session, console: Consol
     cached prefix no longer describes what is on disk. The conversation goes
     with it, since ``messages[0]`` holds the old document blocks.
     """
+    # str() of an APIStatusError includes the response body, and an
+    # ExtractionError names files on disk: both are escaped before printing.
     try:
         corpus, check = load_corpus(api_token_counter(client, system=SYSTEM_PROMPT))
     except (ExtractionError, CorpusTooLargeError) as exc:
         console.print(
-            Text(f"Reload failed, so the loaded corpus is unchanged: {exc}", style="bold red")
+            Text(
+                f"Reload failed, so the loaded corpus is unchanged: {escape_controls(str(exc))}",
+                style="bold red",
+            )
         )
         return
     except OSError as exc:
         console.print(
-            Text(f"Could not record the corpus fingerprint: {exc}", style="bold red")
+            Text(
+                f"Could not record the corpus fingerprint: {escape_controls(str(exc))}",
+                style="bold red",
+            )
         )
         return
     except (anthropic.APIStatusError, anthropic.APIConnectionError) as exc:
         console.print(
             Text(
-                f"Could not count the reloaded corpus: {exc}. The loaded corpus is "
-                f"unchanged.",
+                f"Could not count the reloaded corpus: {escape_controls(str(exc))}. The "
+                f"loaded corpus is unchanged.",
                 style="bold red",
             )
         )
@@ -478,25 +486,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         client = build_client()
     except (FileNotFoundError, ValueError) as exc:
         # credentials.py never puts the key itself in an error message.
-        print(f"Cannot load the API key: {exc}", file=sys.stderr)
+        print(f"Cannot load the API key: {escape_controls(str(exc))}", file=sys.stderr)
         return 2
 
     try:
         corpus, check = load_corpus(api_token_counter(client, system=SYSTEM_PROMPT))
     except (ExtractionError, CorpusTooLargeError) as exc:
-        print(f"Corpus assembly failed: {exc}", file=sys.stderr)
+        print(f"Corpus assembly failed: {escape_controls(str(exc))}", file=sys.stderr)
         return 1
     except OSError as exc:
-        print(f"Could not record the corpus fingerprint: {exc}", file=sys.stderr)
+        print(f"Could not record the corpus fingerprint: {escape_controls(str(exc))}", file=sys.stderr)
         return 1
     except anthropic.AuthenticationError:
         print("Authentication failed. Check the key file in config.API_KEY_PATH.", file=sys.stderr)
         return 2
     except anthropic.RateLimitError as exc:
-        print(f"Rate limited or out of quota: {exc.message}", file=sys.stderr)
+        print(f"Rate limited or out of quota: {escape_controls(exc.message)}", file=sys.stderr)
         return 2
     except anthropic.APIStatusError as exc:
-        print(f"API error {exc.status_code}: {exc.message}", file=sys.stderr)
+        print(f"API error {exc.status_code}: {escape_controls(exc.message)}", file=sys.stderr)
         return 2
     except anthropic.APIConnectionError:
         print("Network error reaching the API.", file=sys.stderr)

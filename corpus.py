@@ -45,6 +45,7 @@ from config import (
     TOKEN_CEILING,
 )
 from credentials import build_client
+from display import escape_controls
 from extract import ExtractedDocument, ExtractionError, extract_corpus
 
 #: Counts the input tokens of a request whose first user message holds these
@@ -59,7 +60,15 @@ _PLACEHOLDER_QUESTION = "?"
 #: unreadable rather than guessed at.
 _STATE_VERSION = 1
 
-_STATE_DOCUMENT_KEYS = frozenset({"filename", "label", "chars", "text_sha256"})
+#: Every field a recorded document must have, and its type. A field of the
+#: wrong type would otherwise pass validation and raise later, while the
+#: changes are being described.
+_STATE_DOCUMENT_TYPES: dict[str, type] = {
+    "filename": str,
+    "label": str,
+    "chars": int,
+    "text_sha256": str,
+}
 
 
 class CorpusTooLargeError(RuntimeError):
@@ -337,7 +346,10 @@ def _parse_state(raw: str) -> dict[str, Any]:
         and isinstance(state.get("lxml_version"), str)
         and isinstance(documents, list)
         and all(
-            isinstance(document, dict) and _STATE_DOCUMENT_KEYS <= document.keys()
+            isinstance(document, dict)
+            and all(
+                isinstance(document.get(key), kind) for key, kind in _STATE_DOCUMENT_TYPES.items()
+            )
             for document in documents
         )
     )
@@ -411,25 +423,27 @@ def main() -> int:
         client = build_client()
     except (FileNotFoundError, ValueError) as exc:
         # credentials.py never puts the key itself in an error message.
-        print(f"Cannot load the API key: {exc}", file=sys.stderr)
+        print(f"Cannot load the API key: {escape_controls(str(exc))}", file=sys.stderr)
         return 2
 
+    # Exception text can carry an API response body or a file name from disk,
+    # so it is escaped like any other untrusted text.
     try:
         corpus, check = load_corpus(api_token_counter(client, system=SYSTEM_PROMPT))
     except (ExtractionError, CorpusTooLargeError) as exc:
-        print(f"Corpus assembly failed: {exc}", file=sys.stderr)
+        print(f"Corpus assembly failed: {escape_controls(str(exc))}", file=sys.stderr)
         return 1
     except OSError as exc:
-        print(f"Could not record the corpus fingerprint: {exc}", file=sys.stderr)
+        print(f"Could not record the corpus fingerprint: {escape_controls(str(exc))}", file=sys.stderr)
         return 1
     except anthropic.AuthenticationError:
         print("Authentication failed. Check the key file in config.API_KEY_PATH.", file=sys.stderr)
         return 2
     except anthropic.RateLimitError as exc:
-        print(f"Rate limited or out of quota: {exc.message}", file=sys.stderr)
+        print(f"Rate limited or out of quota: {escape_controls(exc.message)}", file=sys.stderr)
         return 2
     except anthropic.APIStatusError as exc:
-        print(f"API error {exc.status_code}: {exc.message}", file=sys.stderr)
+        print(f"API error {exc.status_code}: {escape_controls(exc.message)}", file=sys.stderr)
         return 2
     except anthropic.APIConnectionError:
         print("Network error reaching the API.", file=sys.stderr)

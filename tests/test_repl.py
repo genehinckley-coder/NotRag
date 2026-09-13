@@ -13,7 +13,9 @@ the network blip that caused it.
 
 from __future__ import annotations
 
+import copy
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -23,6 +25,7 @@ import pytest
 from anthropic.types import Message
 
 import repl
+from answer import cost_usd
 from config import (
     CACHE_READ_TOLERANCE_FRACTION,
     CONTEXT_WARN_FRACTION,
@@ -30,13 +33,14 @@ from config import (
     CONVERSATION_CACHE_TTL,
     MATCH_DISCLAIMER,
 )
-from corpus import Corpus
+from corpus import Corpus, CorpusTooLargeError
+from extract import ExtractionError
 from repl import Session, replayable
 from test_answer import (
     ALPHA,
     BRAVO,
-    DOCUMENTS,
     FakeStream,
+    api_error,
     cite,
     corpus_of,
     make_console,
@@ -48,17 +52,6 @@ from test_answer import (
 )
 
 CITED = message_of(text_block("Sumps.", cite(0, 10, text="Alpha text")))
-
-
-def api_error(kind: type[anthropic.APIStatusError], status: int, message: str) -> Exception:
-    """An SDK status error, built the way the SDK builds one.
-
-    The SDK vendors its HTTP client as ``httpx2``; its exceptions are typed
-    against that, not against ``httpx``.
-    """
-    request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
-    return kind(message, response=httpx2.Response(status, request=request), body=None)
-
 
 CONNECTION_ERROR = anthropic.APIConnectionError(
     request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
@@ -212,27 +205,31 @@ def test_a_successful_turn_is_committed_in_alternating_order() -> None:
 
 
 @pytest.mark.parametrize(
-    "error",
+    ("error", "says"),
     [
-        CONNECTION_ERROR,
-        api_error(anthropic.RateLimitError, 429, "rate limited"),
-        api_error(anthropic.BadRequestError, 400, "bad request"),
-        api_error(anthropic.AuthenticationError, 401, "invalid key"),
-        api_error(anthropic.InternalServerError, 500, "overloaded"),
-        KeyboardInterrupt(),
+        (CONNECTION_ERROR, "Network error reaching the API"),
+        (api_error(anthropic.RateLimitError, 429, "rate limited"), "Rate limited or out of quota"),
+        (api_error(anthropic.BadRequestError, 400, "bad request"), "rejected the request (400)"),
+        (api_error(anthropic.AuthenticationError, 401, "invalid key"), "Authentication failed"),
+        (api_error(anthropic.InternalServerError, 500, "overloaded"), "API error 500"),
+        (KeyboardInterrupt(), "Interrupted"),
     ],
+    ids=["connection", "rate-limit", "bad-request", "auth", "server", "interrupt"],
 )
-def test_a_failed_turn_leaves_the_conversation_untouched(error: BaseException) -> None:
+def test_a_failed_turn_leaves_the_conversation_untouched(error: BaseException, says: str) -> None:
     session = session_of()
     ask(session, ScriptedClient(CITED), "First?")
-    before = list(session.messages)
+    # Deep, so a failure path that edited a committed message in place would show.
+    before = copy.deepcopy(session.messages)
 
     out = ask(session, ScriptedClient(error), "Second?")
 
     assert session.messages == before
     assert alternates(session)
-    assert session.turns == 1
-    assert out.strip(), "a dropped turn must say so"
+    assert session.turns == 1 and session.questions == 1
+    # Each failure kind gets its own message; the plan asks for rate limits
+    # and credit exhaustion in particular to be named.
+    assert says in " ".join(out.split())
 
 
 def test_the_turn_after_a_failure_still_sends_a_valid_conversation() -> None:
@@ -390,6 +387,23 @@ def test_a_first_turn_that_read_a_tail_does_not_make_the_next_turn_a_miss() -> N
     assert session.record(usage_of(read=199_727)) == []
 
 
+def test_a_first_turn_split_between_write_and_read_expects_their_sum() -> None:
+    # Part of the prefix was still warm and the rest was written afresh.
+    session = session_of()
+
+    session.record(usage_of(write_1h=150_000, read=49_727))
+
+    assert session.cached_prefix_tokens == 199_727
+
+
+def test_a_shortfall_exactly_at_the_tolerance_is_not_a_miss() -> None:
+    session = session_of()
+    session.record(usage_of(read=199_727))
+    at_limit = 199_727 - int(199_727 * CACHE_READ_TOLERANCE_FRACTION)
+
+    assert session.record(usage_of(read=at_limit)) == []
+
+
 def test_a_shortfall_past_the_tolerance_is_still_a_miss() -> None:
     session = session_of()
     session.record(usage_of(read=199_727))
@@ -445,6 +459,33 @@ def test_the_request_size_is_this_turn_not_the_sum_of_turns() -> None:
     session.record(usage_of(input_tokens=20, read=199_727))
 
     assert session.request_tokens == 199_747
+
+
+def test_the_request_size_counts_every_input_bucket() -> None:
+    session = session_of()
+
+    session.record(usage_of(input_tokens=10, write_1h=199_727, write_5m=20, read=5))
+
+    assert session.request_tokens == 10 + 199_727 + 20 + 5
+
+
+# --- Bill --------------------------------------------------------------------
+
+
+def test_the_session_bill_totals_each_bucket_separately() -> None:
+    cold = usage_of(input_tokens=10, write_1h=199_727, write_5m=20, output_tokens=3_000)
+    warm = usage_of(input_tokens=30, write_5m=400, read=199_747, output_tokens=2_000)
+    session = session_of()
+
+    session.record(cold)
+    session.record(warm)
+
+    assert session.questions == 2
+    assert session.input_tokens == 40
+    assert session.cache_write_tokens == 199_727 + 20 + 400
+    assert session.cache_read_tokens == 199_747
+    assert session.output_tokens == 5_000
+    assert session.cost == pytest.approx(cost_usd(cold) + cost_usd(warm))
 
 
 # --- Disclaimer --------------------------------------------------------------
@@ -618,21 +659,34 @@ def test_reload_of_an_unchanged_corpus_keeps_the_cache_expectation(
     assert "byte-identical" in out
 
 
-def test_a_failed_reload_keeps_the_corpus_and_the_conversation(
-    fake_reload: dict[str, Any],
+@pytest.mark.parametrize(
+    "error",
+    [
+        ExtractionError("admincode is \x1b[31mempty"),
+        CorpusTooLargeError(401_000, 400_000),
+        OSError("state file is \x1b[31mlocked"),
+        api_error(anthropic.InternalServerError, 500, "over\x1b[31mloaded"),
+        CONNECTION_ERROR,
+    ],
+    ids=["extraction", "too-large", "state-file", "api-status", "connection"],
+)
+def test_a_failed_reload_keeps_the_corpus_the_conversation_and_the_baseline(
+    fake_reload: dict[str, Any], error: BaseException
 ) -> None:
-    from extract import ExtractionError
-
     session = session_of()
     ask(session, ScriptedClient(CITED), "Q?")
-    before = list(session.messages)
-    fake_reload["documents"] = ExtractionError("admincode is empty")
+    session.cached_prefix_tokens = 199_727
+    corpus, before = session.corpus, copy.deepcopy(session.messages)
+    fake_reload["documents"] = error
 
     out = drive(session, ScriptedClient(), "/reload")
 
+    assert session.corpus is corpus
     assert session.messages == before
-    assert session.corpus.documents[0].text == ALPHA.text
-    assert "Reload failed" in out
+    assert session.cached_prefix_tokens == 199_727
+    # The session carries on, and says why the reload did not happen.
+    assert "Reloaded" not in out and ("Reload failed" in out or "Could not" in out)
+    assert "\x1b" not in out
 
 
 # --- Rendering ---------------------------------------------------------------
@@ -645,18 +699,32 @@ def test_the_answer_and_its_checked_sources_are_printed() -> None:
     assert "[1] Part A, characters 0-10  matched" in out
 
 
-def test_documents_are_checked_against_the_corpus_actually_loaded() -> None:
-    # The reporter must compare against the texts this session sent, so a
-    # citation into BRAVO is checked against BRAVO.
-    session = session_of()
-    message = message_of(
-        text_block("Bravo.", cite(0, 11, text="Bravo text.", document_index=1))
-    )
+def test_quotes_are_checked_against_the_corpus_this_session_loaded() -> None:
+    # The reporter must compare against the texts this session sent. The quote
+    # is in no module-level document, so only the session's own second
+    # document can match it -- not another document, not a test constant.
+    message = message_of(text_block("Unique.", cite(0, 11, text="Unique text", document_index=1)))
 
-    out = ask(session, ScriptedClient(message), "Q?")
+    own = ask(session_of(ALPHA, replace(BRAVO, text="Unique text.")), ScriptedClient(message), "Q?")
+    other = ask(session_of(ALPHA, BRAVO), ScriptedClient(message), "Q?")
 
-    assert "matched" in out
-    assert DOCUMENTS[1] == "Bravo text."
+    assert "characters 0-11  matched" in own
+    assert "characters 0-11  MISMATCH" in other
+
+
+def test_main_escapes_error_text(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def failing_load(count_tokens: Any, **kwargs: Any) -> None:
+        raise api_error(anthropic.RateLimitError, 429, "slow \x1b[31mdown")
+
+    monkeypatch.setattr(repl, "build_client", lambda: ScriptedClient())
+    monkeypatch.setattr(repl, "load_corpus", failing_load)
+
+    assert repl.main([]) == 2
+    err = capsys.readouterr().err
+    assert "\x1b" not in err
+    assert "slow \\x1b[31mdown" in err
 
 
 def test_an_error_message_cannot_drive_the_terminal() -> None:
